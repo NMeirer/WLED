@@ -152,12 +152,12 @@ bool Segment::allocateData(size_t len) {
   if (data && _dataLen == len) return true; //already allocated
   deallocateData();
   if (Segment::getUsedSegmentData() + len > MAX_SEGMENT_DATA) return false; //not enough memory
-  // do not use SPI RAM on ESP32 since it is slow
-  //#if defined(ARDUINO_ARCH_ESP32) && defined(BOARD_HAS_PSRAM) && defined(WLED_USE_PSRAM)
-  //if (psramFound())
-  //  data = (byte*) ps_malloc(len);
-  //else
-  //#endif
+  // if possible use SPI RAM on ESP32
+  #if defined(ARDUINO_ARCH_ESP32) && defined(WLED_USE_PSRAM)
+  if (psramFound())
+    data = (byte*) ps_malloc(len);
+  else
+  #endif
     data = (byte*) malloc(len);
   if (!data) return false; //allocation failed
   Segment::addUsedSegmentData(len);
@@ -181,12 +181,16 @@ void Segment::deallocateData() {
   * because it could access the data buffer and this method
   * may free that data buffer.
   */
-void Segment::resetIfRequired() {
-  if (reset) {
+void Segment::resetIfRequired(uint8_t querriedMode, uint32_t now) {
+  if (reset && querriedMode == mode) { // ensures reset call is triggered wenn mode is changed
     if (leds && !Segment::_globalLeds) { free(leds); leds = nullptr; }
     if (transitional && _t) { transitional = false; delete _t; _t = nullptr; }
     deallocateData();
-    next_time = 0; step = 0; call = 0; aux0 = 0; aux1 = 0;
+    next_time = 0; step = 0; call = 0; aux0 = 0; aux1 = 0; processed = 0;
+    if(fxMode == 1)
+    {
+      startTime = now;
+    }
     reset = false; // setOption(SEG_OPTION_RESET, false);
   }
 }
@@ -369,17 +373,17 @@ void Segment::handleTransition() {
   if (!transitional) return;
   unsigned long maxWait = millis() + 20;
   if (mode == FX_MODE_STATIC && next_time > maxWait) next_time = maxWait;
-  if (progress() == 0xFFFFU) {
-    if (_t) {
-      if (_t->_modeP != mode) markForReset();
-      delete _t;
-      _t = nullptr;
+  if (_t) { // changed so that it is marked to reset before finish -> so reset can happen while transition
+      if (_t->_modeP != mode) markForReset(); // mode changed during transition
+      if (progress() == 0xFFFFU) { // transition finished
+        delete _t;
+        _t = nullptr;
+        transitional = false; // finish transitioning segment
+      }
     }
-    transitional = false; // finish transitioning segment
   }
-}
 
-void Segment::setUp(uint16_t i1, uint16_t i2, uint8_t grp, uint8_t spc, uint16_t ofs, uint16_t i1Y, uint16_t i2Y) {
+void Segment::set(uint16_t i1, uint16_t i2, uint8_t grp, uint8_t spc, uint16_t ofs, uint16_t i1Y, uint16_t i2Y) {
   //return if neither bounds nor grouping have changed
   bool boundsUnchanged = (start == i1 && stop == i2);
   #ifndef WLED_DISABLE_2D
@@ -474,7 +478,7 @@ void Segment::setMode(uint8_t fx, bool loadDefaults) {
         sOpt = extractModeDefaults(fx, "o2");   check2    = (sOpt >= 0) ? (bool)sOpt : false;
         sOpt = extractModeDefaults(fx, "o3");   check3    = (sOpt >= 0) ? (bool)sOpt : false;
         sOpt = extractModeDefaults(fx, "m12");  if (sOpt >= 0) map1D2D   = constrain(sOpt, 0, 7);
-        sOpt = extractModeDefaults(fx, "si");   if (sOpt >= 0) soundSim  = constrain(sOpt, 0, 1);
+        sOpt = extractModeDefaults(fx, "si");   if (sOpt >= 0) soundSim  = constrain(sOpt, 0, 7);
         sOpt = extractModeDefaults(fx, "rev");  if (sOpt >= 0) reverse   = (bool)sOpt;
         sOpt = extractModeDefaults(fx, "mi");   if (sOpt >= 0) mirror    = (bool)sOpt; // NOTE: setting this option is a risky business
         sOpt = extractModeDefaults(fx, "rY");   if (sOpt >= 0) reverse_y = (bool)sOpt;
@@ -750,7 +754,7 @@ uint8_t Segment::differs(Segment& b) const {
   if (startY != b.startY)       d |= SEG_DIFFERS_BOUNDS;
   if (stopY != b.stopY)         d |= SEG_DIFFERS_BOUNDS;
 
-  //bit pattern: (msb first) set:2, sound:1, mapping:3, transposed, mirrorY, reverseY, [transitional, reset,] paused, mirrored, on, reverse, [selected]
+  //bit pattern: (msb first) sound:3, mapping:3, transposed, mirrorY, reverseY, [transitional, reset,] paused, mirrored, on, reverse, [selected]
   if ((options & 0b1111111110011110U) != (b.options & 0b1111111110011110U)) d |= SEG_DIFFERS_OPT;
   if ((options & 0x0001U) != (b.options & 0x0001U))                         d |= SEG_DIFFERS_SEL;
   for (uint8_t i = 0; i < NUM_COLORS; i++) if (colors[i] != b.colors[i])    d |= SEG_DIFFERS_COL;
@@ -1007,7 +1011,7 @@ void WS2812FX::finalizeInit(void)
   //reset segment runtimes
   for (segment &seg : _segments) {
     seg.markForReset();
-    seg.resetIfRequired();
+    seg.resetIfRequired(seg.currentMode(seg.mode),now);
   }
 
   // for the lack of better place enumerate ledmaps here
@@ -1091,18 +1095,21 @@ void WS2812FX::service() {
   now = nowUp + timebase;
   if (nowUp - _lastShow < MIN_SHOW_DELAY) return;
   bool doShow = false;
-
+  uint8_t _querriedMode = 0; // internal mode 
   _isServicing = true;
   _segment_index = 0;
   for (segment &seg : _segments) {
-    // reset the segment runtime data if needed
-    seg.resetIfRequired();
-
-    if (!seg.isActive()) continue;
+       if (!seg.isActive()) continue;
 
     // last condition ensures all solid segments are updated at the same time
     if(nowUp > seg.next_time || _triggered || (doShow && seg.mode == FX_MODE_STATIC))
     {
+      //reset right before mode call
+      //should prevent glitches when switching modes
+      // querry for mode next to reset
+      _querriedMode = seg.currentMode(seg.mode);
+      // reset the segment runtime data if needed
+      seg.resetIfRequired(_querriedMode, now);
       if (seg.grouping == 0) seg.grouping = 1; //sanity check
       doShow = true;
       uint16_t delay = FRAMETIME;
@@ -1120,7 +1127,7 @@ void WS2812FX::service() {
         // effect blending (execute previous effect)
         // actual code may be a bit more involved as effects have runtime data including allocated memory
         //if (seg.transitional && seg._modeP) (*_mode[seg._modeP])(progress());
-        delay = (*_mode[seg.currentMode(seg.mode)])();
+        delay = (*_mode[_querriedMode])();
         if (seg.mode != FX_MODE_HALLOWEEN_EYES) seg.call++;
         if (seg.transitional && delay > FRAMETIME) delay = FRAMETIME; // force faster updates during transition
 
@@ -1330,14 +1337,6 @@ void WS2812FX::setBrightness(uint8_t b, bool direct) {
   }
 }
 
-uint8_t WS2812FX::getActiveSegsLightCapabilities(bool selectedOnly) {
-  uint8_t totalLC = 0;
-  for (segment &seg : _segments) {
-    if (seg.isActive() && (!selectedOnly || seg.isSelected())) totalLC |= seg.getLightCapabilities();
-  }
-  return totalLC;
-}
-
 uint8_t WS2812FX::getFirstSelectedSegId(void)
 {
   size_t i = 0;
@@ -1435,7 +1434,7 @@ Segment& WS2812FX::getSegment(uint8_t id) {
 
 void WS2812FX::setSegment(uint8_t n, uint16_t i1, uint16_t i2, uint8_t grouping, uint8_t spacing, uint16_t offset, uint16_t startY, uint16_t stopY) {
   if (n >= _segments.size()) return;
-  _segments[n].setUp(i1, i2, grouping, spacing, offset, startY, stopY);
+  _segments[n].set(i1, i2, grouping, spacing, offset, startY, stopY);
 }
 
 void WS2812FX::restartRuntime() {

@@ -329,7 +329,7 @@ typedef enum mapping1D2D {
   M12_pCorner = 3
 } mapping1D2D_t;
 
-// segment, 72 bytes
+// segment, 72 bytes // new segment, 81 bytes
 typedef struct Segment {
   public:
     uint16_t start; // start index / start X coordinate 2D (left)
@@ -353,8 +353,7 @@ typedef struct Segment {
         bool    mirror_y    : 1;  //     8 : mirrored Y (2D)
         bool    transpose   : 1;  //     9 : transposed (2D, swapped X & Y)
         uint8_t map1D2D     : 3;  // 10-12 : mapping for 1D effect on 2D (0-use as strip, 1-expand vertically, 2-circular/arc, 3-rectangular/corner, ...)
-        uint8_t soundSim    : 1;  //    13 : 0-1 sound simulation types ("soft" & "hard" or "on"/"off")
-        uint8_t set         : 2;  // 14-15 : 0-3 UI segment sets/groups
+        uint8_t soundSim    : 3;  // 13-15 : 0-7 sound simulation types
       };
     };
     uint8_t  grouping, spacing;
@@ -368,6 +367,7 @@ typedef struct Segment {
       bool    check2  : 1;        // checkmark 2
       bool    check3  : 1;        // checkmark 3
     };
+    uint8_t fxMode;  // effect mode 0 = default; 1 = start at beginning;  
     uint8_t startY;  // start Y coodrinate 2D (top); there should be no more than 255 rows
     uint8_t stopY;   // stop Y coordinate 2D (bottom); there should be no more than 255 rows
     char *name;
@@ -378,6 +378,9 @@ typedef struct Segment {
     uint32_t call;  // call counter
     uint16_t aux0;  // custom var
     uint16_t aux1;  // custom var
+    int16_t processed; //processed counter -1 for not available
+    int16_t processedLast; //last processed counter
+    uint32_t startTime; // time of fx call
     byte* data;     // effect data pointer
     CRGB* leds;     // local leds[] array (may be a pointer to global)
     static CRGB *_globalLeds;             // global leds[] array
@@ -454,6 +457,7 @@ typedef struct Segment {
       check1(false),
       check2(false),
       check3(false),
+      fxMode(1),
       startY(0),
       stopY(1),
       name(nullptr),
@@ -462,6 +466,9 @@ typedef struct Segment {
       call(0),
       aux0(0),
       aux1(0),
+      processed(0), 
+      processedLast(0), 
+      startTime(0),
       data(nullptr),
       leds(nullptr),
       _capabilities(0),
@@ -516,7 +523,7 @@ typedef struct Segment {
     static uint16_t getUsedSegmentData(void)    { return _usedSegmentData; }
     static void     addUsedSegmentData(int len) { _usedSegmentData += len; }
 
-    void    setUp(uint16_t i1, uint16_t i2, uint8_t grp=1, uint8_t spc=0, uint16_t ofs=UINT16_MAX, uint16_t i1Y=0, uint16_t i2Y=1);
+    void    set(uint16_t i1, uint16_t i2, uint8_t grp=1, uint8_t spc=0, uint16_t ofs=UINT16_MAX, uint16_t i1Y=0, uint16_t i2Y=1);
     bool    setColor(uint8_t slot, uint32_t c); //returns true if changed
     void    setCCT(uint16_t k);
     void    setOpacity(uint8_t o);
@@ -530,7 +537,7 @@ typedef struct Segment {
     inline uint16_t dataSize(void) const { return _dataLen; }
     bool allocateData(size_t len);
     void deallocateData(void);
-    void resetIfRequired(void);
+    void resetIfRequired(uint8_t querriedMode, uint32_t now);
     /**
       * Flags that before the next effect is calculated,
       * the internal segment state should be reset.
@@ -742,7 +749,6 @@ class WS2812FX {  // 96 bytes
     void fill(uint32_t c) { for (int i = 0; i < getLengthTotal(); i++) setPixelColor(i, c); } // fill whole strip with color (inline)
     void addEffect(uint8_t id, mode_ptr mode_fn, const char *mode_name); // add effect to the list; defined in FX.cpp
     void setupEffectData(void); // add default effects to the list; defined in FX.cpp
-
     // outsmart the compiler :) by correctly overloading
     inline void setPixelColor(int n, uint8_t r, uint8_t g, uint8_t b, uint8_t w = 0) { setPixelColor(n, RGBW32(r,g,b,w)); }
     inline void setPixelColor(int n, CRGB c) { setPixelColor(n, c.red, c.green, c.blue); }
@@ -772,7 +778,6 @@ class WS2812FX {  // 96 bytes
       getActiveSegmentsNum(void),
       getFirstSelectedSegId(void),
       getLastActiveSegmentId(void),
-      getActiveSegsLightCapabilities(bool selectedOnly = false),
       setPixelSegment(uint8_t n);
 
     inline uint8_t getBrightness(void) { return _brightness; }
